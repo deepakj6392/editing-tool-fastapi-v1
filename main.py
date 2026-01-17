@@ -14,7 +14,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -164,7 +164,7 @@ async def get_video_metadata(video: UploadFile = File(...)):
 
 
 @app.post("/video/process")
-async def process_video_endpoint(request: Request):
+async def process_video_endpoint(request: Request, background_tasks: BackgroundTasks):
     """
     Process video with trim, brightness, contrast, saturation, text/logo overlays.
     Supports dynamic logo file fields like 'logo_0', 'logo_1', etc.
@@ -223,16 +223,15 @@ async def process_video_endpoint(request: Request):
     
     # Find logo files (logo_0, logo_1, etc.)
     logo_files: Dict[str, str] = {}
-    logo_pattern = re.compile(r'^logo_(\d+)$')
-    
+
     for key, value in form_data.items():
-        if isinstance(value, UploadFile):
-            match = logo_pattern.match(key)
+        if hasattr(value, 'filename') and key.startswith('logo_'):
+            match = re.match(r'^logo_(\d+)$', key)
             if match:
                 idx = int(match.group(1))
                 overlay_key = f"logoOverlay_{idx}"
                 overlay_config_str = form_data.get(overlay_key, "{}") or "{}"
-                
+
                 try:
                     overlay_config = json.loads(overlay_config_str)
                     if overlay_config and "filename" in overlay_config:
@@ -282,7 +281,10 @@ async def process_video_endpoint(request: Request):
             raise HTTPException(status_code=500, detail="Video processing failed")
         
         log_debug(f"SUCCESS: Video processed -> {output_path}")
-        
+
+        # Schedule cleanup of output file after response is sent
+        background_tasks.add_task(cleanup_file, output_path)
+
         return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
         
     except HTTPException:
