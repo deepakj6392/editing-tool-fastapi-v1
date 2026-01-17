@@ -2,6 +2,20 @@
 
 A simple and clean FastAPI server with image background removal capability.
 
+## 🚀 Quick Start
+
+Run the project with these commands:
+
+```bash
+cd fastapi_backend
+source venv/bin/activate
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+**Access the server:**
+- API URL: http://localhost:8000
+- Swagger Docs: http://localhost:8000/docs
+
 ## Prerequisites
 
 ### Required Software
