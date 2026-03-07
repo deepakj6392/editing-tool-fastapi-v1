@@ -1,6 +1,6 @@
-# FastAPI Server with Background Removal and Video Processing
+# FastAPI Server with Background Removal, EPS Conversion, and Video Processing
 
-A FastAPI server with image background removal and video processing capabilities using FFmpeg.
+A FastAPI server with image background removal, EPS-to-SVG conversion, and video processing capabilities.
 
 ## 🚀 Quick Start
 
@@ -22,6 +22,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - **Python 3.12** (Required - Python 3.14 is not supported by rembg)
 - **Homebrew** (for macOS users, to install Python 3.12 and FFmpeg)
 - **FFmpeg** (required for video processing)
+- **Inkscape** (recommended for EPS to SVG conversion)
+- **Ghostscript** (optional; only works if built with SVG device support)
 
 ### Check Your Python Version
 ```bash
@@ -46,6 +48,22 @@ brew install ffmpeg
 # Verify installation
 ffmpeg -version
 ffprobe -version
+```
+
+**Install Inkscape (recommended for EPS to SVG conversion):**
+```bash
+brew install --cask inkscape
+
+# Verify installation
+inkscape --version
+```
+
+**Install Ghostscript (optional for EPS to SVG conversion):**
+```bash
+brew install ghostscript
+
+# Verify installation
+gs --version
 ```
 
 ## Installation Steps
@@ -110,6 +128,11 @@ Open your browser and navigate to:
 |--------|----------|-------------|--------------|
 | POST | `/remove-bg` | Remove image background | `file`: Image file (PNG, JPG, etc.) |
 
+### EPS Conversion
+| Method | Endpoint | Description | Request Body |
+|--------|----------|-------------|--------------|
+| POST | `/convert/eps-to-svg` | Convert EPS file to SVG | `file`: EPS file |
+
 ### FFmpeg Check
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -119,7 +142,16 @@ Open your browser and navigate to:
 | Method | Endpoint | Description | Request Body |
 |--------|----------|-------------|--------------|
 | POST | `/video/info` | Get video metadata (duration, resolution, fps) | `video`: Video file |
-| POST | `/video/process` | Process video (trim, adjust, overlay) | `video`, `trimStart`, `trimDuration`, `brightness`, `contrast`, `saturation`, `textOverlays`, `logoOverlays`, `files` |
+| POST | `/video/process` | Process video (trim, adjust, overlays, music) | `video`, `trimStart`, `trimDuration`, `brightness`, `contrast`, `saturation`, `textOverlays`, `logoOverlays`, optional `logo_{index}`, optional `music`, `musicStart`, `musicEnd`, `musicVolume` |
+
+## EPS Conversion API Details
+
+### Convert EPS to SVG
+```bash
+curl -X POST -F "file=@diagram.eps" http://localhost:8000/convert/eps-to-svg --output diagram.svg
+```
+
+Response: SVG file download (`image/svg+xml`)
 
 ## Video Processing API Details
 
@@ -174,7 +206,6 @@ curl -X POST \
   -F "video=@input.mp4" \
   -F "trimStart=10" \
   -F "trimDuration=30" \
-  -F "output.mp4" \
   http://localhost:8000/video/process
 ```
 
@@ -202,7 +233,8 @@ curl -X POST \
 ```bash
 curl -X POST \
   -F "video=@input.mp4" \
-  -F "logoFiles=@logo.png" \
+  -F "logo_0=@logo.png" \
+  -F 'logoOverlay_0={"filename":"logo.png","x":90,"y":90,"width":100,"height":100,"start":0,"end":10}' \
   -F 'logoOverlays=[{"filename":"logo.png","x":90,"y":90,"width":100,"height":100,"start":0,"end":10}]' \
   http://localhost:8000/video/process
 ```
@@ -217,8 +249,13 @@ curl -X POST \
   -F "contrast=1.1" \
   -F "saturation=1.2" \
   -F 'textOverlays=[{"text":"My Video","x":50,"y":10,"start":0,"end":30,"fontsize":36,"fontcolor":"white"}]' \
-  -F "logoFiles=@logo.png" \
+  -F "logo_0=@logo.png" \
+  -F 'logoOverlay_0={"filename":"logo.png","x":85,"y":85,"width":80,"height":80,"start":0}' \
   -F 'logoOverlays=[{"filename":"logo.png","x":85,"y":85,"width":80,"height":80,"start":0}]' \
+  -F "music=@music.mp3" \
+  -F "musicStart=0" \
+  -F "musicEnd=60" \
+  -F "musicVolume=0.8" \
   http://localhost:8000/video/process
 ```
 
@@ -234,7 +271,12 @@ curl -X POST \
 | `saturation` | float | 1.0 | 0 to 4 | Saturation adjustment |
 | `textOverlays` | string | "[]" | JSON | JSON array of text overlays |
 | `logoOverlays` | string | "[]" | JSON | JSON array of logo overlays |
-| `files` | Files | [] | - | Logo image files to upload |
+| `logo_{index}` | File | Optional | - | Logo file input for each `logoOverlays[index]` |
+| `logoOverlay_{index}` | string | Optional | JSON | JSON object for matching uploaded logo file |
+| `music` | File | Optional | - | Background music file |
+| `musicStart` | float | 0.0 | ≥0 | Music start time on timeline (seconds) |
+| `musicEnd` | float | null | ≥0 | Music end time on timeline (seconds) |
+| `musicVolume` | float | 1.0 | 0 to 2 | Music volume multiplier (0=mute, 1=normal, 2=max boost) |
 
 ### Text Overlay Object
 ```json
@@ -366,4 +408,3 @@ uvicorn main:app --reload --port 8001
 
 ## License
 MIT License
-

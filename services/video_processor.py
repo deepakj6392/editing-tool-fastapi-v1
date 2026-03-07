@@ -7,7 +7,7 @@ import json
 import os
 import asyncio
 import shutil
-from pathlib import Path
+import re
 from typing import Optional, List, Tuple, Dict, Any
 from models.video_process import TextOverlay, LogoOverlay
 
@@ -46,8 +46,8 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
     ffprobe_cmd = [
         'ffprobe',
         '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,codec_name,r_frame_rate,display_aspect_ratio',
+        '-show_entries',
+        'stream=index,codec_type,codec_name,width,height,r_frame_rate,display_aspect_ratio,channels,sample_rate',
         '-show_entries', 'format=duration,size,bit_rate,format_name',
         '-of', 'json',
         input_path
@@ -66,10 +66,15 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
         
         probe_data = json.loads(stdout.decode())
         
-        if 'streams' not in probe_data or len(probe_data['streams']) == 0:
+        streams = probe_data.get('streams', [])
+        if len(streams) == 0:
             raise VideoProcessingError("No video stream found in file")
-        
-        video_stream = probe_data['streams'][0]
+
+        video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
+        if not video_stream:
+            raise VideoProcessingError("No video stream found in file")
+
+        audio_stream = next((s for s in streams if s.get('codec_type') == 'audio'), None)
         format_info = probe_data.get('format', {})
         
         # Calculate FPS from r_frame_rate (e.g., "30/1" -> 30.0)
@@ -81,6 +86,7 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
             'size': int(format_info.get('size', 0)),
             'bitrate': int(format_info.get('bit_rate', 0)),
             'format': format_info.get('format_name', 'unknown'),
+            'has_audio': bool(audio_stream),
             'video': {
                 'codec': video_stream.get('codec_name', 'unknown'),
                 'width': int(video_stream.get('width', 0)),
@@ -89,6 +95,13 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
                 'aspect_ratio': video_stream.get('display_aspect_ratio', '16:9')
             }
         }
+
+        if audio_stream:
+            info['audio'] = {
+                'codec': audio_stream.get('codec_name', 'unknown'),
+                'channels': int(audio_stream.get('channels', 0) or 0),
+                'sample_rate': int(audio_stream.get('sample_rate', 0) or 0),
+            }
         
         return info
         
@@ -98,6 +111,45 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
         raise VideoProcessingError(f"Failed to parse ffprobe output: {str(e)}")
 
 
+def _resolve_overlay_time(primary: Optional[float], secondary: Optional[float], default: Optional[float]) -> Optional[float]:
+    """Resolve overlay time from multiple aliases without treating 0 as falsy."""
+    if primary is not None:
+        return float(primary)
+    if secondary is not None:
+        return float(secondary)
+    return default
+
+
+def _escape_drawtext_text(text: str) -> str:
+    """Escape text for FFmpeg drawtext filter."""
+    return (
+        text
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+        .replace("\n", "\\n")
+    )
+
+
+def _normalize_ffmpeg_color(color: Optional[str]) -> str:
+    """
+    Normalize frontend color strings for FFmpeg drawtext.
+    Converts #RRGGBB / #RGB to 0xRRGGBB for better filter compatibility.
+    """
+    if not color:
+        return 'white'
+    value = str(color).strip()
+    if not value.startswith('#'):
+        return value
+    hex_value = value[1:]
+    if len(hex_value) == 3 and re.fullmatch(r'[0-9a-fA-F]{3}', hex_value):
+        hex_value = ''.join(ch * 2 for ch in hex_value)
+    if re.fullmatch(r'[0-9a-fA-F]{6}([0-9a-fA-F]{2})?', hex_value):
+        return f"0x{hex_value}"
+    return 'white'
+
+
 def build_overlay_filter(
     trim_start: float,
     text_overlays: List[TextOverlay],
@@ -105,6 +157,7 @@ def build_overlay_filter(
     logo_files: Dict[str, str],  # filename -> file_path mapping
     video_width: int,
     video_height: int,
+    logo_file_sequence: Optional[List[Optional[str]]] = None,
     brightness: float = 0.0,
     contrast: float = 1.0,
     saturation: float = 1.0
@@ -117,6 +170,7 @@ def build_overlay_filter(
         text_overlays: List of text overlay configurations
         logo_overlays: List of logo overlay configurations
         logo_files: Dictionary mapping logo filenames to file paths
+        logo_file_sequence: Optional list of file paths aligned to logo_overlays index
         video_width: Video width in pixels
         video_height: Video height in pixels
         brightness: Brightness adjustment (-1 to 1)
@@ -127,14 +181,21 @@ def build_overlay_filter(
         Tuple of (filter_complex string, list of additional input files)
     """
     inputs: List[str] = []
-    input_index = 1
-    
-    # Add logo inputs first
-    for logo in logo_overlays:
-        logo_file_path = logo_files.get(logo.filename)
+    resolved_logo_paths: List[Optional[str]] = []
+
+    for idx, logo in enumerate(logo_overlays):
+        logo_file_path: Optional[str] = None
+        if logo_file_sequence and idx < len(logo_file_sequence):
+            logo_file_path = logo_file_sequence[idx]
+        if not logo_file_path:
+            logo_file_path = logo_files.get(logo.filename)
         if logo_file_path and os.path.exists(logo_file_path):
+            resolved_logo_paths.append(logo_file_path)
             inputs.extend(['-i', logo_file_path])
-    
+        else:
+            resolved_logo_paths.append(None)
+
+    # Add logo inputs first
     # Build filter complex
     # Start with brightness/contrast/saturation adjustment
     # eq=brightness=X:contrast=Y:saturation=Z
@@ -145,17 +206,19 @@ def build_overlay_filter(
     
     # Add logo overlays
     for idx, logo in enumerate(logo_overlays):
-        logo_file_path = logo_files.get(logo.filename)
-        if not logo_file_path or not os.path.exists(logo_file_path):
+        logo_file_path = resolved_logo_paths[idx] if idx < len(resolved_logo_paths) else None
+        if not logo_file_path:
             continue
         
         # Calculate start and end times relative to trim
-        start_time = max(0, (logo.start or logo.startTime or 0) - trim_start)
-        end_time = (logo.end or logo.endTime)
+        start_value = _resolve_overlay_time(logo.start, logo.startTime, 0.0) or 0.0
+        end_value = _resolve_overlay_time(logo.end, logo.endTime, None)
+        start_time = max(0.0, start_value - trim_start)
+        end_time = end_value
         if end_time is not None:
-            end_time = max(0, end_time - trim_start)
-        
-        enable_clause = f"enable='between(t,{start_time},{end_time if end_time is not None else 'INF'})'"
+            end_time = max(0.0, end_time - trim_start)
+
+        enable_clause = f"enable='between(t,{start_time},{end_time if end_time is not None else 1e9})'"
         
         # Scale logo based on video resolution
         # Assuming frontend preview is 640px wide
@@ -177,12 +240,14 @@ def build_overlay_filter(
     # Add text overlays
     for idx, text in enumerate(text_overlays):
         # Calculate start and end times relative to trim
-        start_time = max(0, (text.start or text.startTime or 0) - trim_start)
-        end_time = (text.end or text.endTime)
+        start_value = _resolve_overlay_time(text.start, text.startTime, 0.0) or 0.0
+        end_value = _resolve_overlay_time(text.end, text.endTime, None)
+        start_time = max(0.0, start_value - trim_start)
+        end_time = end_value
         if end_time is not None:
-            end_time = max(0, end_time - trim_start)
-        
-        enable_clause = f"enable='between(t,{start_time},{end_time if end_time is not None else 'INF'})'"
+            end_time = max(0.0, end_time - trim_start)
+
+        enable_clause = f"enable='between(t,{start_time},{end_time if end_time is not None else 1e9})'"
         
         # Scale font size based on video resolution
         preview_width = 640
@@ -191,11 +256,9 @@ def build_overlay_filter(
         scaled_fontsize = round(base_fontsize * scale_factor)
         
         # Get font color (handle alternative field names)
-        font_color = text.color or text.fontcolor or 'white'
-        
-        # Escape single quotes in text
-        escaped_text = text.text.replace("'", "\\'")
-        
+        font_color = _normalize_ffmpeg_color(text.color or text.fontcolor or 'white')
+        escaped_text = _escape_drawtext_text(text.text or '')
+
         drawtext_filter = f"drawtext=text='{escaped_text}':x=(w*{text.x}/100):y=(h*{text.y}/100):fontsize={scaled_fontsize}:fontcolor={font_color}:{enable_clause}"
         
         filter_complex += f";[{current_label}]{drawtext_filter}[outtext{idx}]"
@@ -218,6 +281,11 @@ async def process_video(
     text_overlays: Optional[List[TextOverlay]] = None,
     logo_overlays: Optional[List[LogoOverlay]] = None,
     logo_files: Optional[Dict[str, str]] = None,
+    logo_file_sequence: Optional[List[Optional[str]]] = None,
+    music_path: Optional[str] = None,
+    music_start: float = 0.0,
+    music_end: Optional[float] = None,
+    music_volume: float = 1.0,
     debug_mode: bool = False
 ) -> bool:
     """
@@ -234,6 +302,7 @@ async def process_video(
         text_overlays: List of text overlay configurations
         logo_overlays: List of logo overlay configurations
         logo_files: Dictionary mapping logo filenames to file paths
+        logo_file_sequence: Optional list of logo file paths aligned to overlays by index
         debug_mode: If True, keep intermediate files for debugging
         
     Returns:
@@ -254,6 +323,7 @@ async def process_video(
     text_overlays = text_overlays or []
     logo_overlays = logo_overlays or []
     logo_files = logo_files or {}
+    logo_file_sequence = logo_file_sequence or []
     
     # Build filter complex
     filter_complex, additional_inputs = build_overlay_filter(
@@ -261,6 +331,7 @@ async def process_video(
         text_overlays=text_overlays,
         logo_overlays=logo_overlays,
         logo_files=logo_files,
+        logo_file_sequence=logo_file_sequence,
         video_width=video_width,
         video_height=video_height,
         brightness=brightness,
@@ -268,26 +339,96 @@ async def process_video(
         saturation=saturation
     )
     
+    source_duration = float(video_info.get('duration', 0) or 0)
+    has_source_audio = bool(video_info.get('has_audio'))
+    output_duration = trim_duration
+    if output_duration is None and source_duration > 0:
+        output_duration = max(0.0, source_duration - trim_start)
+    if output_duration is not None and output_duration <= 0:
+        raise VideoProcessingError("Trim duration is 0 after applying trim start/time range")
+
     # Build FFmpeg command
     ffmpeg_cmd = [
         'ffmpeg',
-        '-i', input_path,
-        *additional_inputs,
         '-ss', str(trim_start),
     ]
-    
-    # Add duration if specified
-    if trim_duration is not None:
-        ffmpeg_cmd.extend(['-t', str(trim_duration)])
+
+    if output_duration is not None:
+        ffmpeg_cmd.extend(['-t', str(output_duration)])
+
+    ffmpeg_cmd.extend([
+        '-i', input_path,
+        *additional_inputs,
+    ])
+
+    logo_input_count = len(additional_inputs) // 2
+    music_input_index: Optional[int] = None
+    if music_path and os.path.exists(music_path):
+        music_input_index = 1 + logo_input_count
+        ffmpeg_cmd.extend(['-i', music_path])
+
+    filter_complex_audio = filter_complex
+    map_audio_args: List[str] = []
+    audio_codec_args: List[str] = []
+
+    if music_input_index is not None and output_duration is not None:
+        norm_music_start = max(0.0, float(music_start or 0.0))
+        norm_music_end = float(music_end) if music_end is not None else (trim_start + output_duration)
+        if norm_music_end < norm_music_start:
+            norm_music_end = norm_music_start
+
+        music_output_start = max(0.0, norm_music_start - trim_start)
+        music_overlap_end = min(output_duration, max(0.0, norm_music_end - trim_start))
+        music_active_duration = max(0.0, music_overlap_end - music_output_start)
+        music_input_seek = max(0.0, trim_start - norm_music_start)
+        bounded_music_volume = max(0.0, min(float(music_volume), 2.0))
+
+        if music_active_duration > 0.001:
+            if has_source_audio:
+                filter_complex_audio += ';[0:a]anull[srca]'
+                source_audio_label = 'srca'
+            else:
+                filter_complex_audio += f";anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={output_duration},asetpts=N/SR/TB[srca]"
+                source_audio_label = 'srca'
+
+            filter_complex_audio += (
+                f";[{music_input_index}:a]atrim=start={music_input_seek}:duration={music_active_duration},"
+                f"asetpts=PTS-STARTPTS,volume={bounded_music_volume}[musicclip]"
+            )
+
+            if music_output_start > 0:
+                delay_ms = int(round(music_output_start * 1000))
+                filter_complex_audio += f";[musicclip]adelay={delay_ms}|{delay_ms}[musicaligned]"
+            else:
+                filter_complex_audio += ';[musicclip]anull[musicaligned]'
+
+            filter_complex_audio += f";[{source_audio_label}][musicaligned]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[outa]"
+            map_audio_args = ['-map', '[outa]']
+            audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
+        elif has_source_audio:
+            map_audio_args = ['-map', '0:a?']
+            audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
+    elif has_source_audio:
+        map_audio_args = ['-map', '0:a?']
+        audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
     
     ffmpeg_cmd.extend([
-        '-filter_complex', filter_complex,
+        '-filter_complex', filter_complex_audio,
         '-map', '[outv]',
+    ])
+
+    if map_audio_args:
+        ffmpeg_cmd.extend(map_audio_args)
+        ffmpeg_cmd.extend(audio_codec_args)
+    else:
+        ffmpeg_cmd.append('-an')
+
+    ffmpeg_cmd.extend([
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
-        '-y',  # Overwrite output
+        '-y',
         output_path
     ])
     
@@ -331,4 +472,3 @@ def cleanup_files(file_paths: List[str]) -> None:
     """Safely delete multiple files"""
     for path in file_paths:
         cleanup_file(path)
-

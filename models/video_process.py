@@ -75,6 +75,11 @@ class VideoProcessRequest(BaseModel):
     textOverlays: str = Field(default="[]", description="JSON-encoded array of text overlays")
     logoOverlays: str = Field(default="[]", description="JSON-encoded array of logo overlays")
 
+    # Optional music track parameters
+    musicStart: Optional[float] = Field(default=0.0, ge=0, alias="musicStart", description="Music track start time on timeline (seconds)")
+    musicEnd: Optional[float] = Field(default=None, ge=0, alias="musicEnd", description="Music track end time on timeline (seconds)")
+    musicVolume: Optional[float] = Field(default=1.0, ge=0, le=2, alias="musicVolume", description="Music volume multiplier (0-2)")
+
     class Config:
         populate_by_name = True
 
@@ -104,4 +109,3 @@ class ProcessStatus(BaseModel):
     message: str = Field(..., description="Status message")
     output_path: Optional[str] = Field(default=None, description="Path to processed video")
     debug_mode: bool = Field(default=False, description="Whether debug mode is enabled")
-
