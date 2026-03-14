@@ -79,6 +79,7 @@ class VideoProcessRequest(BaseModel):
     musicStart: Optional[float] = Field(default=0.0, ge=0, alias="musicStart", description="Music track start time on timeline (seconds)")
     musicEnd: Optional[float] = Field(default=None, ge=0, alias="musicEnd", description="Music track end time on timeline (seconds)")
     musicVolume: Optional[float] = Field(default=1.0, ge=0, le=2, alias="musicVolume", description="Music volume multiplier (0-2)")
+    sourceAudioVolume: Optional[float] = Field(default=1.0, ge=0, le=2, alias="sourceAudioVolume", description="Original video audio volume multiplier (0-2)")
 
     class Config:
         populate_by_name = True

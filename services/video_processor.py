@@ -286,6 +286,7 @@ async def process_video(
     music_start: float = 0.0,
     music_end: Optional[float] = None,
     music_volume: float = 1.0,
+    source_audio_volume: float = 1.0,
     debug_mode: bool = False
 ) -> bool:
     """
@@ -341,6 +342,8 @@ async def process_video(
     
     source_duration = float(video_info.get('duration', 0) or 0)
     has_source_audio = bool(video_info.get('has_audio'))
+    bounded_source_audio_volume = max(0.0, min(float(source_audio_volume), 2.0))
+    source_audio_enabled = has_source_audio and bounded_source_audio_volume > 0.001
     output_duration = trim_duration
     if output_duration is None and source_duration > 0:
         output_duration = max(0.0, source_duration - trim_start)
@@ -384,12 +387,10 @@ async def process_video(
         bounded_music_volume = max(0.0, min(float(music_volume), 2.0))
 
         if music_active_duration > 0.001:
-            if has_source_audio:
-                filter_complex_audio += ';[0:a]anull[srca]'
-                source_audio_label = 'srca'
+            if source_audio_enabled:
+                filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume}[srca]'
             else:
                 filter_complex_audio += f";anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={output_duration},asetpts=N/SR/TB[srca]"
-                source_audio_label = 'srca'
 
             filter_complex_audio += (
                 f";[{music_input_index}:a]atrim=start={music_input_seek}:duration={music_active_duration},"
@@ -402,14 +403,16 @@ async def process_video(
             else:
                 filter_complex_audio += ';[musicclip]anull[musicaligned]'
 
-            filter_complex_audio += f";[{source_audio_label}][musicaligned]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[outa]"
+            filter_complex_audio += ';[srca][musicaligned]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[outa]'
             map_audio_args = ['-map', '[outa]']
             audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
-        elif has_source_audio:
-            map_audio_args = ['-map', '0:a?']
+        elif source_audio_enabled:
+            filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume},aresample=async=1[outa]'
+            map_audio_args = ['-map', '[outa]']
             audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
-    elif has_source_audio:
-        map_audio_args = ['-map', '0:a?']
+    elif source_audio_enabled:
+        filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume},aresample=async=1[outa]'
+        map_audio_args = ['-map', '[outa]']
         audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
     
     ffmpeg_cmd.extend([

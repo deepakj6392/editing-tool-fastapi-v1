@@ -265,6 +265,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
     music_start = _parse_form_float(form_data, "musicStart", 0.0, minimum=0.0)
     music_end = _parse_form_float(form_data, "musicEnd", None, minimum=0.0, allow_none=True)
     music_volume = _parse_form_float(form_data, "musicVolume", 1.0, minimum=0.0, maximum=2.0)
+    source_audio_volume = _parse_form_float(form_data, "sourceAudioVolume", 1.0, minimum=0.0, maximum=2.0)
     if music_end is not None and music_end < music_start:
         music_end = music_start
     
@@ -383,6 +384,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
             music_start=music_start,
             music_end=music_end,
             music_volume=music_volume,
+            source_audio_volume=source_audio_volume,
             debug_mode=DEBUG_MODE
         )
         
