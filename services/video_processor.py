@@ -282,6 +282,7 @@ async def process_video(
     logo_overlays: Optional[List[LogoOverlay]] = None,
     logo_files: Optional[Dict[str, str]] = None,
     logo_file_sequence: Optional[List[Optional[str]]] = None,
+    music_tracks: Optional[List[Dict[str, Any]]] = None,
     music_path: Optional[str] = None,
     music_start: float = 0.0,
     music_end: Optional[float] = None,
@@ -365,45 +366,96 @@ async def process_video(
     ])
 
     logo_input_count = len(additional_inputs) // 2
-    music_input_index: Optional[int] = None
-    if music_path and os.path.exists(music_path):
-        music_input_index = 1 + logo_input_count
-        ffmpeg_cmd.extend(['-i', music_path])
+    music_track_defs: List[Dict[str, Any]] = []
+    for track in (music_tracks or []):
+        if not isinstance(track, dict):
+            continue
+        track_path = track.get("path")
+        if not track_path or not os.path.exists(track_path):
+            continue
+        music_track_defs.append({
+            "path": track_path,
+            "start": float(track.get("start", 0.0) or 0.0),
+            "end": float(track["end"]) if track.get("end") is not None else None,
+            "volume": float(track.get("volume", 1.0) or 1.0),
+        })
+
+    # Backward compatibility for single music input.
+    if not music_track_defs and music_path and os.path.exists(music_path):
+        music_track_defs.append({
+            "path": music_path,
+            "start": float(music_start or 0.0),
+            "end": float(music_end) if music_end is not None else None,
+            "volume": float(music_volume or 1.0),
+        })
+
+    music_input_indexes: List[int] = []
+    for track in music_track_defs:
+        music_input_indexes.append(1 + logo_input_count + len(music_input_indexes))
+        ffmpeg_cmd.extend(['-i', track["path"]])
 
     filter_complex_audio = filter_complex
     map_audio_args: List[str] = []
     audio_codec_args: List[str] = []
 
-    if music_input_index is not None and output_duration is not None:
-        norm_music_start = max(0.0, float(music_start or 0.0))
-        norm_music_end = float(music_end) if music_end is not None else (trim_start + output_duration)
-        if norm_music_end < norm_music_start:
-            norm_music_end = norm_music_start
+    if output_duration is not None:
+        active_music_labels: List[str] = []
+        for idx, track in enumerate(music_track_defs):
+            input_index = music_input_indexes[idx]
+            norm_music_start = max(0.0, float(track.get("start", 0.0) or 0.0))
+            track_end = track.get("end")
+            norm_music_end = float(track_end) if track_end is not None else (trim_start + output_duration)
+            if norm_music_end < norm_music_start:
+                norm_music_end = norm_music_start
 
-        music_output_start = max(0.0, norm_music_start - trim_start)
-        music_overlap_end = min(output_duration, max(0.0, norm_music_end - trim_start))
-        music_active_duration = max(0.0, music_overlap_end - music_output_start)
-        music_input_seek = max(0.0, trim_start - norm_music_start)
-        bounded_music_volume = max(0.0, min(float(music_volume), 2.0))
+            music_output_start = max(0.0, norm_music_start - trim_start)
+            music_overlap_end = min(output_duration, max(0.0, norm_music_end - trim_start))
+            music_active_duration = max(0.0, music_overlap_end - music_output_start)
+            if music_active_duration <= 0.001:
+                continue
 
-        if music_active_duration > 0.001:
-            if source_audio_enabled:
-                filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume}[srca]'
-            else:
-                filter_complex_audio += f";anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={output_duration},asetpts=N/SR/TB[srca]"
+            music_input_seek = max(0.0, trim_start - norm_music_start)
+            bounded_music_volume = max(0.0, min(float(track.get("volume", 1.0) or 1.0), 2.0))
+            clip_label = f"musicclip{idx}"
+            aligned_label = f"musicaligned{idx}"
 
             filter_complex_audio += (
-                f";[{music_input_index}:a]atrim=start={music_input_seek}:duration={music_active_duration},"
-                f"asetpts=PTS-STARTPTS,volume={bounded_music_volume}[musicclip]"
+                f";[{input_index}:a]atrim=start={music_input_seek}:duration={music_active_duration},"
+                f"asetpts=PTS-STARTPTS,volume={bounded_music_volume}[{clip_label}]"
             )
 
             if music_output_start > 0:
                 delay_ms = int(round(music_output_start * 1000))
-                filter_complex_audio += f";[musicclip]adelay={delay_ms}|{delay_ms}[musicaligned]"
+                filter_complex_audio += f";[{clip_label}]adelay={delay_ms}|{delay_ms}[{aligned_label}]"
             else:
-                filter_complex_audio += ';[musicclip]anull[musicaligned]'
+                filter_complex_audio += f";[{clip_label}]anull[{aligned_label}]"
 
-            filter_complex_audio += ';[srca][musicaligned]amix=inputs=2:duration=first:dropout_transition=2,aresample=async=1[outa]'
+            active_music_labels.append(aligned_label)
+
+        if active_music_labels:
+            if source_audio_enabled:
+                filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume}[srca]'
+            else:
+                filter_complex_audio += (
+                    f";anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=duration={output_duration},asetpts=N/SR/TB[srca]"
+                )
+            if len(active_music_labels) == 1:
+                music_mix_label = active_music_labels[0]
+            else:
+                running_label = active_music_labels[0]
+                for mix_idx, next_label in enumerate(active_music_labels[1:]):
+                    mixed_label = f"musicmix{mix_idx}"
+                    filter_complex_audio += (
+                        f";[{running_label}][{next_label}]amix=inputs=2:duration=longest:dropout_transition=2[{mixed_label}]"
+                    )
+                    running_label = mixed_label
+                music_mix_label = running_label
+
+            filter_complex_audio += (
+                f";[srca][{music_mix_label}]amix=inputs=2:duration=first:dropout_transition=2,"
+                f"aresample=async=1[outa]"
+            )
             map_audio_args = ['-map', '[outa]']
             audio_codec_args = ['-c:a', 'aac', '-b:a', '192k']
         elif source_audio_enabled:

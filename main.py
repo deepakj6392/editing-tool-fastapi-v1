@@ -410,7 +410,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
     if not video_filename:
         video_file = None
         for key, value in form_data.items():
-            if _is_upload_file(value) and not key.startswith('logo_') and key != 'music':
+            if _is_upload_file(value) and not key.startswith('logo_') and key != 'music' and not key.startswith('music_'):
                 video_file = value
                 video_filename = value.filename
                 break
@@ -431,6 +431,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
     music_end = _parse_form_float(form_data, "musicEnd", None, minimum=0.0, allow_none=True)
     music_volume = _parse_form_float(form_data, "musicVolume", 1.0, minimum=0.0, maximum=2.0)
     source_audio_volume = _parse_form_float(form_data, "sourceAudioVolume", 1.0, minimum=0.0, maximum=2.0)
+    music_tracks_raw = _parse_json_array(form_data, "musicTracks")
     if music_end is not None and music_end < music_start:
         music_end = music_start
 
@@ -518,6 +519,32 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
         music_file_path = os.path.join(UPLOAD_DIR, f"music_{uuid.uuid4().hex}_{safe_music_name}")
         temp_files_to_cleanup.append(music_file_path)
 
+    parsed_music_tracks: List[Dict[str, Any]] = []
+    for index, item in enumerate(music_tracks_raw):
+        if not isinstance(item, dict):
+            continue
+        file_key = item.get("fileKey") or f"music_{index}"
+        music_upload = form_data.get(file_key)
+        if not _is_upload_file(music_upload):
+            continue
+        safe_name = _safe_filename(getattr(music_upload, "filename", None), f"{file_key}.mp3")
+        track_path = os.path.join(UPLOAD_DIR, f"{file_key}_{uuid.uuid4().hex}_{safe_name}")
+        temp_files_to_cleanup.append(track_path)
+        with open(track_path, "wb") as f:
+            content = await music_upload.read()
+            f.write(content)
+        track_start = _parse_form_float(item, "startTime", 0.0, minimum=0.0)
+        track_end = _parse_form_float(item, "endTime", None, minimum=0.0, allow_none=True)
+        track_volume = _parse_form_float(item, "volume", 1.0, minimum=0.0, maximum=2.0)
+        if track_end is not None and track_end < track_start:
+            track_end = track_start
+        parsed_music_tracks.append({
+            "path": track_path,
+            "start": track_start,
+            "end": track_end,
+            "volume": track_volume,
+        })
+
     try:
         with open(temp_video_path, "wb") as f:
             content = await video_file.read()
@@ -545,6 +572,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
             logo_overlays=logo_overlays,
             logo_files=logo_files_by_filename,
             logo_file_sequence=logo_file_sequence,
+            music_tracks=parsed_music_tracks,
             music_path=music_file_path,
             music_start=music_start,
             music_end=music_end,
