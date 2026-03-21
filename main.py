@@ -28,11 +28,16 @@ from models.video_process import (
 from services.video_processor import (
     get_video_info,
     process_video,
+    compress_video,
+    extract_audio,
+    generate_gif,
     cleanup_file,
     is_ffmpeg_installed,
     is_ffprobe_installed,
     VideoProcessingError,
 )
+from services.video_deleter import delete_frame_from_video
+
 from services.background_remover import (
     remove_background,
     BackgroundRemovalError,
@@ -219,6 +224,166 @@ async def get_video_metadata(video: UploadFile = File(...)):
             cleanup_file(temp_video_path)
 
 
+@app.post("/video/compress")
+async def compress_video_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Compress video (with optional trim).
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+    
+    # Get video file (prefer "video", fallback to first file)
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        for key, value in form_data.items():
+            if _is_upload_file(value):
+                video_file = value
+                break
+    
+    if not video_file:
+        raise HTTPException(status_code=400, detail="No video file found")
+    
+    safe_video_name = _safe_filename(video_file.filename, "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"comp_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files = [temp_video_path]
+    
+    trim_start = _parse_form_float(form_data, "trimStart", 0.0, minimum=0.0)
+    trim_duration = _parse_form_float(form_data, "trimDuration", None, minimum=0.1, allow_none=True)
+    
+    try:
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+        
+        output_path = os.path.join(OUTPUT_DIR, f"compressed_{Path(safe_video_name).stem}_{uuid.uuid4().hex}.mp4")
+        
+        success = await compress_video(
+            input_path=temp_video_path,
+            output_path=output_path,
+            trim_start=trim_start,
+            trim_duration=trim_duration
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Compression failed")
+        
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files:
+                cleanup_file(f)
+
+
+@app.post("/video/audio")
+async def extract_audio_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Extract original audio from video.
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+    
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        for key, value in form_data.items():
+            if _is_upload_file(value):
+                video_file = value
+                break
+    
+    if not video_file:
+        raise HTTPException(status_code=400, detail="No video file found")
+    
+    safe_video_name = _safe_filename(video_file.filename, "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"audio_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files = [temp_video_path]
+    
+    try:
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+        
+        output_path = os.path.join(OUTPUT_DIR, f"{Path(safe_video_name).stem}_audio_{uuid.uuid4().hex}.m4a")
+        
+        success = await extract_audio(temp_video_path, output_path)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Audio extraction failed")
+        
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="audio/mp4", filename=Path(output_path).name)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files:
+                cleanup_file(f)
+
+
+@app.post("/video/gif")
+async def generate_gif_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Generate GIF from video (first 10s default).
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+    
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        for key, value in form_data.items():
+            if _is_upload_file(value):
+                video_file = value
+                break
+    
+    if not video_file:
+        raise HTTPException(status_code=400, detail="No video file found")
+    
+    safe_video_name = _safe_filename(video_file.filename, "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"gif_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files = [temp_video_path]
+    
+    start_time = _parse_form_float(form_data, "startTime", 0.0, minimum=0.0)
+    gif_duration = _parse_form_float(form_data, "duration", 10.0, minimum=1.0, maximum=30.0)
+    gif_width = int(_parse_form_float(form_data, "width", 640, minimum=320, maximum=1280) or 640)
+    
+    try:
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+        
+        output_path = os.path.join(OUTPUT_DIR, f"{Path(safe_video_name).stem}_gif_{uuid.uuid4().hex}.gif")
+        
+        success = await generate_gif(
+            temp_video_path,
+            output_path,
+            start_time=start_time,
+            duration=gif_duration,
+            width=gif_width
+        )
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="GIF generation failed")
+        
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="image/gif", filename=Path(output_path).name)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files:
+                cleanup_file(f)
+
+
 @app.post("/video/process")
 async def process_video_endpoint(request: Request, background_tasks: BackgroundTasks):
     """
@@ -249,13 +414,13 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
                 video_file = value
                 video_filename = value.filename
                 break
-    
+
     if not video_file:
         log_debug("No video file found!")
         raise HTTPException(status_code=400, detail="No video file found in request")
-    
+
     log_debug(f"Video file: {video_filename}")
-    
+
     # Get other parameters
     trim_start = _parse_form_float(form_data, "trimStart", 0.0, minimum=0.0)
     trim_duration = _parse_form_float(form_data, "trimDuration", None, minimum=0.1, allow_none=True)
@@ -268,7 +433,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
     source_audio_volume = _parse_form_float(form_data, "sourceAudioVolume", 1.0, minimum=0.0, maximum=2.0)
     if music_end is not None and music_end < music_start:
         music_end = music_start
-    
+
     # Parse overlays
     text_overlays_raw = _parse_json_array(form_data, "textOverlays")
     logo_overlays_raw = _parse_json_array(form_data, "logoOverlays")
@@ -290,10 +455,10 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
             logo_overlays.append(LogoOverlay(**item))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid logoOverlays[{index}]: {str(exc)}")
-    
+
     log_debug(f"Text overlays: {len(text_overlays)}")
     log_debug(f"Logo overlays: {len(logo_overlays)}")
-    
+
     # Find logo files (logo_0, logo_1, etc.)
     logo_files_by_filename: Dict[str, str] = {}
     logo_files_by_index: Dict[int, str] = {}
@@ -341,7 +506,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
 
     if len(logo_overlays) > 0 and not any(logo_file_sequence):
         log_debug("Warning: Logo overlays present but no logo files found!")
-    
+
     # Save video and optional music track
     safe_video_name = _safe_filename(video_filename, "video.mp4")
     temp_video_path = os.path.join(UPLOAD_DIR, f"proc_{uuid.uuid4().hex}_{safe_video_name}")
@@ -352,7 +517,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
         safe_music_name = _safe_filename(music_file.filename, "music.mp3")
         music_file_path = os.path.join(UPLOAD_DIR, f"music_{uuid.uuid4().hex}_{safe_music_name}")
         temp_files_to_cleanup.append(music_file_path)
-    
+
     try:
         with open(temp_video_path, "wb") as f:
             content = await video_file.read()
@@ -362,12 +527,12 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
             with open(music_file_path, "wb") as f:
                 content = await music_file.read()
                 f.write(content)
-        
+
         output_path = os.path.join(OUTPUT_DIR, f"processed_{Path(safe_video_name).stem}_{uuid.uuid4().hex}.mp4")
-        
+
         log_debug(f"Starting FFmpeg processing...")
         log_debug(f"Output path: {output_path}")
-        
+
         success = await process_video(
             input_path=temp_video_path,
             output_path=output_path,
@@ -387,17 +552,17 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
             source_audio_volume=source_audio_volume,
             debug_mode=DEBUG_MODE
         )
-        
+
         if not success:
             raise HTTPException(status_code=500, detail="Video processing failed")
-        
+
         log_debug(f"SUCCESS: Video processed -> {output_path}")
 
         # Schedule cleanup of output file after response is sent
         background_tasks.add_task(cleanup_file, output_path)
 
         return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -406,6 +571,56 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
     finally:
         if not should_keep_file():
             for f in temp_files_to_cleanup:
+                cleanup_file(f)
+
+@app.post("/video/delete-frame")
+async def delete_frame_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Delete a specific frame/time slice from video by cutting that range out.
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+    
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        raise HTTPException(status_code=400, detail="No video file found")
+    
+    frame_time = _parse_form_float(form_data, "frameTime", None, minimum=0.0)
+    frame_duration = _parse_form_float(form_data, "frameDuration", 0.033, minimum=0.01, maximum=5.0)
+    delete_radius = _parse_form_float(form_data, "deleteRadius", 0.0, minimum=0.0)
+    
+    if frame_time is None:
+        raise HTTPException(status_code=400, detail="frameTime parameter required")
+    
+    safe_video_name = _safe_filename(video_file.filename, "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"del_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files = [temp_video_path]
+    
+    try:
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+        
+        output_path = os.path.join(OUTPUT_DIR, f"{Path(safe_video_name).stem}_frame_deleted_{uuid.uuid4().hex}.mp4")
+        
+        await delete_frame_from_video(
+            temp_video_path,
+            frame_time,
+            frame_duration,
+            output_path,
+            delete_radius
+        )
+        
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files:
                 cleanup_file(f)
 
 

@@ -462,6 +462,183 @@ async def process_video(
         raise VideoProcessingError(f"Failed to execute FFmpeg: {str(e)}")
 
 
+
+async def compress_video(
+    input_path: str,
+    output_path: str,
+    trim_start: float = 0.0,
+    trim_duration: Optional[float] = None,
+    crf: int = 28
+) -> bool:
+    """
+    Compress video with high CRF for small file size.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path for compressed output
+        trim_start: Optional trim start time
+        trim_duration: Optional trim duration
+        crf: Quality (18-28+, higher = smaller/bigger loss)
+    
+    Returns:
+        True if successful
+    """
+    if not os.path.exists(input_path):
+        raise VideoProcessingError(f"Input file not found: {input_path}")
+    
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-ss', str(trim_start),
+    ]
+    if trim_duration is not None:
+        ffmpeg_cmd += ['-t', str(trim_duration)]
+    
+    ffmpeg_cmd += [
+        '-i', input_path,
+        '-c:v', 'libx264',
+        '-crf', str(crf),
+        '-preset', 'fast',
+        '-b:v', '1000k',
+        '-maxrate', '1500k',
+        '-bufsize', '3000k',
+        '-vf', 'scale=-2:720',  # Scale to 720p height, even width
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        '-y', output_path
+    ]
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise VideoProcessingError(f"Compression failed: {stderr.decode()}")
+        
+        if not os.path.exists(output_path):
+            raise VideoProcessingError("Compression completed but no output file")
+        
+        print(f"[SUCCESS] Video compressed: {output_path}")
+        return True
+    except subprocess.SubprocessError as e:
+        raise VideoProcessingError(f"FFmpeg error: {str(e)}")
+
+
+async def extract_audio(
+    input_path: str,
+    output_path: str
+) -> bool:
+    """
+    Extract audio from video without re-encoding.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path for audio output (m4a)
+    
+    Returns:
+        True if successful
+    """
+    if not os.path.exists(input_path):
+        raise VideoProcessingError(f"Input file not found: {input_path}")
+    
+    # Get video info to check if has audio
+    video_info = await get_video_info(input_path)
+    if not video_info.get('has_audio'):
+        raise VideoProcessingError("Input video has no audio track")
+    
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-i', input_path,
+        '-vn',  # No video
+        '-acodec', 'copy',  # Copy audio without re-encoding
+        '-y', output_path
+    ]
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise VideoProcessingError(f"Audio extraction failed: {stderr.decode()}")
+        
+        if not os.path.exists(output_path):
+            raise VideoProcessingError("Audio extraction completed but no output file")
+        
+        print(f"[SUCCESS] Audio extracted: {output_path}")
+        return True
+    except subprocess.SubprocessError as e:
+        raise VideoProcessingError(f"FFmpeg error: {str(e)}")
+
+
+async def generate_gif(
+    input_path: str,
+    output_path: str,
+    start_time: float = 0.0,
+    duration: Optional[float] = 10.0,
+    width: int = 640
+) -> bool:
+    """
+    Generate GIF from video segment.
+    
+    Args:
+        input_path: Path to input video
+        output_path: Path for GIF output
+        start_time: Start time in seconds
+        duration: Duration in seconds (None for end)
+        width: Max width in pixels
+    
+    Returns:
+        True if successful
+    """
+    if not os.path.exists(input_path):
+        raise VideoProcessingError(f"Input file not found: {input_path}")
+    
+    # Single pass GIF generation (more reliable)
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-ss', str(start_time),
+    ]
+    if duration is not None:
+        ffmpeg_cmd += ['-t', str(duration)]
+    
+    ffmpeg_cmd += [
+        '-i', input_path,
+        '-vf', f"fps=10,scale={width}:-1:flags=lanczos",
+        '-t', str(duration or 10),
+        '-y', output_path
+    ]
+    
+     
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+         
+        if process.returncode != 0:
+            raise VideoProcessingError(f"GIF generation failed: {stderr.decode()}")
+        
+        if not os.path.exists(output_path):
+            raise VideoProcessingError("GIF generation completed but no output file")
+        
+        print(f"[SUCCESS] GIF generated: {output_path}")
+        return True
+    except subprocess.SubprocessError as e:
+        raise VideoProcessingError(f"FFmpeg error: {str(e)}")
+
+
+
 def cleanup_file(file_path: str) -> None:
     """Safely delete a file if it exists"""
     try:
@@ -469,6 +646,7 @@ def cleanup_file(file_path: str) -> None:
             os.unlink(file_path)
     except Exception as e:
         print(f"[WARN] Failed to cleanup file {file_path}: {e}")
+
 
 
 def cleanup_files(file_paths: List[str]) -> None:
