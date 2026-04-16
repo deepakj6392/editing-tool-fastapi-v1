@@ -28,6 +28,7 @@ from models.video_process import (
 from services.video_processor import (
     get_video_info,
     process_video,
+    merge_videos,
     compress_video,
     extract_audio,
     generate_gif,
@@ -128,6 +129,97 @@ def _parse_json_array(form_data: Dict[str, Any], key: str) -> List[Any]:
     if not isinstance(parsed, list):
         raise HTTPException(status_code=400, detail=f"'{key}' must be a JSON array")
     return parsed
+
+
+def _parse_merge_clips(form_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = form_data.get("mergeClips", "[]")
+    if raw in (None, ""):
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON in 'mergeClips': {exc.msg}")
+
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="'mergeClips' must be a JSON array")
+
+    clips: List[Dict[str, Any]] = []
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"mergeClips[{index}] must be an object")
+
+        file_key = item.get("fileKey") or f"clip_{index}"
+        position = str(item.get("position", "end") or "end").strip().lower()
+        if position in ("beginning", "intro"):
+            position = "start"
+        if position in ("ending", "outro"):
+            position = "end"
+        if position not in {"start", "end", "insert"}:
+            position = "end"
+
+        insert_time = item.get("insertTime")
+        if insert_time is not None:
+            try:
+                insert_time = float(insert_time)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"mergeClips[{index}].insertTime must be a number")
+            insert_time = max(0.0, insert_time)
+
+        order = item.get("order")
+        try:
+            order = int(order) if order is not None else index
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"mergeClips[{index}].order must be an integer")
+
+        clips.append({
+            "fileKey": file_key,
+            "position": position,
+            "insertTime": insert_time,
+            "order": order,
+        })
+
+    return clips
+
+
+async def _save_uploaded_music_tracks(
+    form_data: Dict[str, Any],
+    music_tracks_raw: List[Any],
+    temp_files_to_cleanup: List[str],
+) -> List[Dict[str, Any]]:
+    parsed_music_tracks: List[Dict[str, Any]] = []
+
+    for index, item in enumerate(music_tracks_raw):
+        if not isinstance(item, dict):
+            continue
+
+        file_key = item.get("fileKey") or f"music_{index}"
+        music_upload = form_data.get(file_key)
+        if not _is_upload_file(music_upload):
+            continue
+
+        safe_name = _safe_filename(getattr(music_upload, "filename", None), f"{file_key}.mp3")
+        track_path = os.path.join(UPLOAD_DIR, f"{file_key}_{uuid.uuid4().hex}_{safe_name}")
+        temp_files_to_cleanup.append(track_path)
+
+        with open(track_path, "wb") as f:
+            content = await music_upload.read()
+            f.write(content)
+
+        track_start = _parse_form_float(item, "startTime", 0.0, minimum=0.0)
+        track_end = _parse_form_float(item, "endTime", None, minimum=0.0, allow_none=True)
+        track_volume = _parse_form_float(item, "volume", 1.0, minimum=0.0, maximum=2.0)
+        if track_end is not None and track_end < track_start:
+            track_end = track_start
+
+        parsed_music_tracks.append({
+            "path": track_path,
+            "start": track_start,
+            "end": track_end,
+            "volume": track_volume,
+        })
+
+    return parsed_music_tracks
 
 
 # Mount static files for output directory
@@ -384,6 +476,184 @@ async def generate_gif_endpoint(request: Request, background_tasks: BackgroundTa
                 cleanup_file(f)
 
 
+@app.post("/video/merge")
+async def merge_video_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Merge additional video clips into a base video.
+
+    Accepts a multipart form with the main base video under the "video" field and a
+    JSON array in "mergeClips" describing each clip to merge.
+
+    Example mergeClips JSON:
+    [
+      {"fileKey":"clip_0","position":"start","order":0},
+      {"fileKey":"clip_1","position":"end","order":0},
+      {"fileKey":"clip_2","position":"insert","insertTime":12.5,"order":0}
+    ]
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        for key, value in form_data.items():
+            if _is_upload_file(value) and key != "music" and not key.startswith("logo_"):
+                video_file = value
+                break
+
+    if not video_file:
+        raise HTTPException(status_code=400, detail="No video file found in request")
+
+    merge_clips = _parse_merge_clips(form_data)
+    if not merge_clips:
+        raise HTTPException(status_code=400, detail="No mergeClips provided")
+
+    safe_video_name = _safe_filename(getattr(video_file, "filename", None), "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"merge_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files_to_cleanup = [temp_video_path]
+
+    saved_clip_paths: List[Dict[str, Any]] = []
+    for index, clip in enumerate(sorted(merge_clips, key=lambda item: (item["order"], item.get("insertTime") or 0.0))):
+        file_key = clip["fileKey"]
+        clip_upload = form_data.get(file_key)
+        if not clip_upload or not _is_upload_file(clip_upload):
+            raise HTTPException(status_code=400, detail=f"Merge clip file not found for key '{file_key}'")
+
+        safe_clip_name = _safe_filename(getattr(clip_upload, "filename", None), f"clip_{index}.mp4")
+        clip_path = os.path.join(UPLOAD_DIR, f"mergeclip_{index}_{uuid.uuid4().hex}_{safe_clip_name}")
+        temp_files_to_cleanup.append(clip_path)
+        with open(clip_path, "wb") as f:
+            content = await clip_upload.read()
+            f.write(content)
+
+        position = clip["position"]
+        insert_time = clip.get("insertTime")
+        if position == "insert" and insert_time is None:
+            raise HTTPException(status_code=400, detail=f"Merge clip '{file_key}' requires an insertTime")
+
+        saved_clip_paths.append({
+            "path": clip_path,
+            "position": position,
+            "insertTime": insert_time,
+            "order": clip["order"],
+        })
+
+    try:
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+
+        output_path = os.path.join(OUTPUT_DIR, f"merged_{Path(safe_video_name).stem}_{uuid.uuid4().hex}.mp4")
+
+        success = await merge_videos(
+            input_path=temp_video_path,
+            output_path=output_path,
+            merge_clips=saved_clip_paths,
+            debug_mode=DEBUG_MODE
+        )
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Video merge failed")
+
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+
+    except HTTPException:
+        raise
+    except VideoProcessingError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files_to_cleanup:
+                cleanup_file(f)
+
+
+@app.post("/video/merge-audio")
+async def merge_audio_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Merge one or more music tracks into a base video and return a new video file.
+
+    Accepts the base video under the "video" field and a JSON array in "musicTracks"
+    describing uploaded audio files and their timing/volume.
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+
+    video_file = form_data.get("video")
+    if not video_file or not _is_upload_file(video_file):
+        for key, value in form_data.items():
+            if _is_upload_file(value) and key != "music" and not key.startswith("music_"):
+                video_file = value
+                break
+
+    if not video_file:
+        raise HTTPException(status_code=400, detail="No video file found in request")
+
+    source_audio_volume = _parse_form_float(form_data, "sourceAudioVolume", 1.0, minimum=0.0, maximum=2.0)
+    music_tracks_raw = _parse_json_array(form_data, "musicTracks")
+    if not music_tracks_raw:
+        raise HTTPException(status_code=400, detail="No musicTracks provided")
+
+    safe_video_name = _safe_filename(getattr(video_file, "filename", None), "video.mp4")
+    temp_video_path = os.path.join(UPLOAD_DIR, f"merge_audio_{uuid.uuid4().hex}_{safe_video_name}")
+    temp_files_to_cleanup = [temp_video_path]
+
+    try:
+        parsed_music_tracks = await _save_uploaded_music_tracks(form_data, music_tracks_raw, temp_files_to_cleanup)
+        if not parsed_music_tracks:
+            raise HTTPException(status_code=400, detail="No valid uploaded music track files found")
+
+        with open(temp_video_path, "wb") as f:
+            content = await video_file.read()
+            f.write(content)
+
+        output_path = os.path.join(OUTPUT_DIR, f"audio_merged_{Path(safe_video_name).stem}_{uuid.uuid4().hex}.mp4")
+
+        success = await process_video(
+            input_path=temp_video_path,
+            output_path=output_path,
+            trim_start=0.0,
+            trim_duration=None,
+            brightness=0.0,
+            contrast=1.0,
+            saturation=1.0,
+            text_overlays=[],
+            logo_overlays=[],
+            logo_files={},
+            logo_file_sequence=[],
+            music_tracks=parsed_music_tracks,
+            music_path=None,
+            music_start=0.0,
+            music_end=None,
+            music_volume=1.0,
+            source_audio_volume=source_audio_volume,
+            debug_mode=DEBUG_MODE,
+        )
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Audio merge failed")
+
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+
+    except HTTPException:
+        raise
+    except VideoProcessingError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files_to_cleanup:
+                cleanup_file(f)
+
+
 @app.post("/video/process")
 async def process_video_endpoint(request: Request, background_tasks: BackgroundTasks):
     """
@@ -519,31 +789,7 @@ async def process_video_endpoint(request: Request, background_tasks: BackgroundT
         music_file_path = os.path.join(UPLOAD_DIR, f"music_{uuid.uuid4().hex}_{safe_music_name}")
         temp_files_to_cleanup.append(music_file_path)
 
-    parsed_music_tracks: List[Dict[str, Any]] = []
-    for index, item in enumerate(music_tracks_raw):
-        if not isinstance(item, dict):
-            continue
-        file_key = item.get("fileKey") or f"music_{index}"
-        music_upload = form_data.get(file_key)
-        if not _is_upload_file(music_upload):
-            continue
-        safe_name = _safe_filename(getattr(music_upload, "filename", None), f"{file_key}.mp3")
-        track_path = os.path.join(UPLOAD_DIR, f"{file_key}_{uuid.uuid4().hex}_{safe_name}")
-        temp_files_to_cleanup.append(track_path)
-        with open(track_path, "wb") as f:
-            content = await music_upload.read()
-            f.write(content)
-        track_start = _parse_form_float(item, "startTime", 0.0, minimum=0.0)
-        track_end = _parse_form_float(item, "endTime", None, minimum=0.0, allow_none=True)
-        track_volume = _parse_form_float(item, "volume", 1.0, minimum=0.0, maximum=2.0)
-        if track_end is not None and track_end < track_start:
-            track_end = track_start
-        parsed_music_tracks.append({
-            "path": track_path,
-            "start": track_start,
-            "end": track_end,
-            "volume": track_volume,
-        })
+    parsed_music_tracks = await _save_uploaded_music_tracks(form_data, music_tracks_raw, temp_files_to_cleanup)
 
     try:
         with open(temp_video_path, "wb") as f:

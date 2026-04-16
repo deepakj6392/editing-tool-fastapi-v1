@@ -50,22 +50,6 @@ ffmpeg -version
 ffprobe -version
 ```
 
-**Install Inkscape (recommended for EPS to SVG conversion):**
-```bash
-brew install --cask inkscape
-
-# Verify installation
-inkscape --version
-```
-
-**Install Ghostscript (optional for EPS to SVG conversion):**
-```bash
-brew install ghostscript
-
-# Verify installation
-gs --version
-```
-
 ## Installation Steps
 
 ### 1. Navigate to the project directory
@@ -143,6 +127,8 @@ Open your browser and navigate to:
 |--------|----------|-------------|--------------|
 | POST | `/video/info` | Get video metadata (duration, resolution, fps) | `video`: Video file |
 | POST | `/video/process` | Process video (trim, adjust, overlays, music) | `video`, `trimStart`, `trimDuration`, `brightness`, `contrast`, `saturation`, `textOverlays`, `logoOverlays`, optional `logo_{index}`, optional `music`, `musicStart`, `musicEnd`, `musicVolume` |
+| POST | `/video/merge` | Merge clips into a base video at start, end, or insert time | `video`, `mergeClips`, optional clip files matching `fileKey` |
+| POST | `/video/merge-audio` | Merge one or more music tracks into a base video | `video`, `musicTracks`, optional music files matching `fileKey`, optional `sourceAudioVolume` |
 
 ## EPS Conversion API Details
 
@@ -227,6 +213,17 @@ curl -X POST \
   -F "trimStart=0" \
   -F 'textOverlays=[{"text":"Hello World","x":50,"y":50,"start":0,"end":10,"fontsize":24,"fontcolor":"white"}]' \
   http://localhost:8000/video/process
+```
+
+**Merge clips at start / end / insert time:**
+```bash
+curl -X POST \
+  -F "video=@base.mp4" \
+  -F 'mergeClips=[{"fileKey":"clip_0","position":"start","order":0},{"fileKey":"clip_1","position":"insert","insertTime":15.0,"order":0},{"fileKey":"clip_2","position":"end","order":0}]' \
+  -F "clip_0=@intro.mp4" \
+  -F "clip_1=@insert.mp4" \
+  -F "clip_2=@outro.mp4" \
+  http://localhost:8000/video/merge
 ```
 
 **With logo overlay:**

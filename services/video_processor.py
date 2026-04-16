@@ -8,6 +8,7 @@ import os
 import asyncio
 import shutil
 import re
+import uuid
 from typing import Optional, List, Tuple, Dict, Any
 from models.video_process import TextOverlay, LogoOverlay
 
@@ -109,6 +110,163 @@ async def get_video_info(input_path: str) -> Dict[str, Any]:
         raise VideoProcessingError(f"Failed to execute ffprobe: {str(e)}")
     except json.JSONDecodeError as e:
         raise VideoProcessingError(f"Failed to parse ffprobe output: {str(e)}")
+
+
+async def _run_ffmpeg_command(command: List[str]) -> Tuple[int, str, str]:
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    return process.returncode, stdout.decode(errors='ignore'), stderr.decode(errors='ignore')
+
+
+async def _create_ts_segment(
+    input_path: str,
+    output_path: str,
+    start: Optional[float] = None,
+    duration: Optional[float] = None
+) -> None:
+    if not os.path.exists(input_path):
+        raise VideoProcessingError(f"Input file not found: {input_path}")
+
+    ffmpeg_cmd = ['ffmpeg']
+    if start is not None:
+        ffmpeg_cmd.extend(['-ss', str(start)])
+    ffmpeg_cmd.extend(['-i', input_path])
+    if duration is not None:
+        ffmpeg_cmd.extend(['-t', str(duration)])
+
+    ffmpeg_cmd.extend([
+        '-c', 'copy',
+        '-bsf:v', 'h264_mp4toannexb',
+        '-f', 'mpegts',
+        '-y',
+        output_path
+    ])
+
+    returncode, _, stderr = await _run_ffmpeg_command(ffmpeg_cmd)
+    if returncode != 0:
+        raise VideoProcessingError(f"Failed to create TS segment: {stderr}")
+
+
+async def merge_videos(
+    input_path: str,
+    output_path: str,
+    merge_clips: List[Dict[str, Any]],
+    debug_mode: bool = False
+) -> bool:
+    if not os.path.exists(input_path):
+        raise VideoProcessingError(f"Input file not found: {input_path}")
+
+    if not merge_clips:
+        raise VideoProcessingError("No merge clips provided")
+
+    video_info = await get_video_info(input_path)
+    base_duration = float(video_info.get('duration', 0) or 0)
+    if base_duration <= 0:
+        raise VideoProcessingError("Base video duration is invalid")
+
+    start_clips = [clip for clip in merge_clips if clip.get('position') == 'start']
+    end_clips = [clip for clip in merge_clips if clip.get('position') == 'end']
+    insert_clips = [clip for clip in merge_clips if clip.get('position') == 'insert']
+
+    start_clips.sort(key=lambda clip: clip.get('order', 0))
+    end_clips.sort(key=lambda clip: clip.get('order', 0))
+    insert_clips.sort(key=lambda clip: (clip.get('insertTime', base_duration / 2), clip.get('order', 0)))
+
+    ts_files: List[str] = []
+    temp_files: List[str] = []
+
+    async def add_clip_ts(clip_path: str) -> str:
+        ts_path = f"{clip_path}.{uuid.uuid4().hex}.ts"
+        temp_files.append(ts_path)
+        await _create_ts_segment(clip_path, ts_path)
+        ts_files.append(ts_path)
+        return ts_path
+
+    for clip in start_clips:
+        await add_clip_ts(clip['path'])
+
+    if insert_clips:
+        current_position = 0.0
+        for clip in insert_clips:
+            insert_at = float(clip.get('insertTime', 0.0) or 0.0)
+            insert_at = max(0.0, min(insert_at, base_duration))
+            if insert_at > current_position + 0.05:
+                segment_path = os.path.join(
+                    os.path.dirname(output_path),
+                    f"base_segment_{uuid.uuid4().hex}.ts"
+                )
+                temp_files.append(segment_path)
+                await _create_ts_segment(
+                    input_path,
+                    segment_path,
+                    start=current_position,
+                    duration=insert_at - current_position
+                )
+                ts_files.append(segment_path)
+                current_position = insert_at
+
+            await add_clip_ts(clip['path'])
+
+        if current_position < base_duration - 0.05:
+            segment_path = os.path.join(
+                os.path.dirname(output_path),
+                f"base_segment_{uuid.uuid4().hex}.ts"
+            )
+            temp_files.append(segment_path)
+            await _create_ts_segment(
+                input_path,
+                segment_path,
+                start=current_position,
+                duration=base_duration - current_position
+            )
+            ts_files.append(segment_path)
+    else:
+        await add_clip_ts(input_path)
+
+    for clip in end_clips:
+        await add_clip_ts(clip['path'])
+
+    concat_list_path = os.path.join(os.path.dirname(output_path), f"concat_{uuid.uuid4().hex}.txt")
+    temp_files.append(concat_list_path)
+
+    with open(concat_list_path, 'w', encoding='utf-8') as concat_file:
+        for ts_file in ts_files:
+            # The concat list is stored inside the outputs directory, so relative
+            # paths like "outputs/foo.ts" would incorrectly resolve to
+            # "outputs/outputs/foo.ts". Write absolute paths instead.
+            concat_file.write(f"file '{os.path.abspath(ts_file)}'\n")
+
+    ffmpeg_cmd = [
+        'ffmpeg',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_list_path,
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-y',
+        output_path
+    ]
+
+    returncode, _, stderr = await _run_ffmpeg_command(ffmpeg_cmd)
+    if returncode != 0:
+        raise VideoProcessingError(f"Failed to merge videos: {stderr}")
+
+    if not os.path.exists(output_path):
+        raise VideoProcessingError("FFmpeg completed but output file was not created")
+
+    if not debug_mode:
+        for temp_path in temp_files:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+
+    return True
 
 
 def _resolve_overlay_time(primary: Optional[float], secondary: Optional[float], default: Optional[float]) -> Optional[float]:
@@ -399,7 +557,7 @@ async def process_video(
     audio_codec_args: List[str] = []
 
     if output_duration is not None:
-        active_music_labels: List[str] = []
+        scheduled_music_segments: List[Dict[str, Any]] = []
         for idx, track in enumerate(music_track_defs):
             input_index = music_input_indexes[idx]
             norm_music_start = max(0.0, float(track.get("start", 0.0) or 0.0))
@@ -417,22 +575,57 @@ async def process_video(
             music_input_seek = max(0.0, trim_start - norm_music_start)
             bounded_music_volume = max(0.0, min(float(track.get("volume", 1.0) or 1.0), 2.0))
             clip_label = f"musicclip{idx}"
-            aligned_label = f"musicaligned{idx}"
 
             filter_complex_audio += (
                 f";[{input_index}:a]atrim=start={music_input_seek}:duration={music_active_duration},"
-                f"asetpts=PTS-STARTPTS,volume={bounded_music_volume}[{clip_label}]"
+                f"asetpts=PTS-STARTPTS,volume={bounded_music_volume},"
+                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{clip_label}]"
             )
 
-            if music_output_start > 0:
-                delay_ms = int(round(music_output_start * 1000))
-                filter_complex_audio += f";[{clip_label}]adelay={delay_ms}|{delay_ms}[{aligned_label}]"
-            else:
-                filter_complex_audio += f";[{clip_label}]anull[{aligned_label}]"
+            scheduled_music_segments.append({
+                "label": clip_label,
+                "start": music_output_start,
+                "duration": music_active_duration,
+            })
 
-            active_music_labels.append(aligned_label)
+        if scheduled_music_segments:
+            scheduled_music_segments.sort(key=lambda item: (item["start"], item["label"]))
+            concat_segment_labels: List[str] = []
+            music_cursor = 0.0
 
-        if active_music_labels:
+            for segment_index, segment in enumerate(scheduled_music_segments):
+                segment_start = max(0.0, float(segment["start"]))
+                segment_duration = max(0.0, float(segment["duration"]))
+                if segment_duration <= 0.001:
+                    continue
+
+                gap_duration = max(0.0, segment_start - music_cursor)
+                if gap_duration > 0.001:
+                    silence_label = f"musicsilence{segment_index}"
+                    filter_complex_audio += (
+                        f";anullsrc=channel_layout=stereo:sample_rate=48000,"
+                        f"atrim=duration={gap_duration},asetpts=N/SR/TB[{silence_label}]"
+                    )
+                    concat_segment_labels.append(silence_label)
+                    music_cursor += gap_duration
+
+                concat_segment_labels.append(segment["label"])
+                music_cursor += segment_duration
+
+            music_concat_label = None
+            if len(concat_segment_labels) == 1:
+                music_concat_label = concat_segment_labels[0]
+            elif len(concat_segment_labels) > 1:
+                music_concat_label = "musicconcat"
+                concat_inputs = ''.join(f'[{label}]' for label in concat_segment_labels)
+                filter_complex_audio += (
+                    f";{concat_inputs}concat=n={len(concat_segment_labels)}:v=0:a=1[{music_concat_label}]"
+                )
+
+        else:
+            music_concat_label = None
+
+        if music_concat_label:
             if source_audio_enabled:
                 filter_complex_audio += f';[0:a]volume={bounded_source_audio_volume}[srca]'
             else:
@@ -440,20 +633,9 @@ async def process_video(
                     f";anullsrc=channel_layout=stereo:sample_rate=48000,"
                     f"atrim=duration={output_duration},asetpts=N/SR/TB[srca]"
                 )
-            if len(active_music_labels) == 1:
-                music_mix_label = active_music_labels[0]
-            else:
-                running_label = active_music_labels[0]
-                for mix_idx, next_label in enumerate(active_music_labels[1:]):
-                    mixed_label = f"musicmix{mix_idx}"
-                    filter_complex_audio += (
-                        f";[{running_label}][{next_label}]amix=inputs=2:duration=longest:dropout_transition=2[{mixed_label}]"
-                    )
-                    running_label = mixed_label
-                music_mix_label = running_label
 
             filter_complex_audio += (
-                f";[srca][{music_mix_label}]amix=inputs=2:duration=first:dropout_transition=2,"
+                f";[srca][{music_concat_label}]amix=inputs=2:duration=first:dropout_transition=2,"
                 f"aresample=async=1[outa]"
             )
             map_audio_args = ['-map', '[outa]']
