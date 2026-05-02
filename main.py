@@ -3,6 +3,7 @@ FastAPI Server with Background Removal and Video Processing capabilities.
 
 Features:
 - Background removal from images (rembg)
+- Image enhancement with Real-ESRGAN
 - Video metadata extraction (ffprobe)
 - Video processing with FFmpeg (trim, adjust, overlays)
 """
@@ -29,6 +30,7 @@ from services.video_processor import (
     get_video_info,
     process_video,
     merge_videos,
+    merge_audio_tracks,
     compress_video,
     extract_audio,
     generate_gif,
@@ -43,9 +45,13 @@ from services.background_remover import (
     remove_background,
     BackgroundRemovalError,
 )
+from services.image_enhancer import (
+    enhance_image,
+    ImageEnhancementError,
+)
 
 
-app = FastAPI(title="FastAPI Server", version="1.0.0")
+app = FastAPI(title="Flarelap FastAPI Server", version="1.0.0")
 
 # CORS middleware
 app.add_middleware(
@@ -277,6 +283,29 @@ async def remove_bg_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process image: {str(e)}")
+
+
+@app.post("/image-enhance")
+async def image_enhance_endpoint(
+    file: UploadFile = File(...),
+    outscale: float = Form(4.0),
+):
+    """
+    Enhance an image using Real-ESRGAN.
+
+    Returns: Enhanced image as PNG
+    """
+    if outscale <= 0 or outscale > 4:
+        raise HTTPException(status_code=400, detail="outscale must be between 0 and 4")
+
+    try:
+        input_image = await file.read()
+        output_image = enhance_image(input_image, outscale=outscale)
+        return Response(content=output_image, media_type="image/png")
+    except ImageEnhancementError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to enhance image: {str(e)}")
 
 
 # =========================
@@ -641,6 +670,61 @@ async def merge_audio_endpoint(request: Request, background_tasks: BackgroundTas
 
         background_tasks.add_task(cleanup_file, output_path)
         return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+
+    except HTTPException:
+        raise
+    except VideoProcessingError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in temp_files_to_cleanup:
+                cleanup_file(f)
+
+
+@app.post("/audio/merge")
+async def merge_audio_files_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Merge uploaded audio files only and return a single M4A audio file.
+
+    Accepts a multipart form with:
+    - musicTracks: JSON array of { fileKey, startTime, endTime?, volume? }
+    - one uploaded audio file for each fileKey, e.g. music_0, music_1
+    - optional duration: output duration in seconds
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    form_data = await request.form()
+    music_tracks_raw = _parse_json_array(form_data, "musicTracks")
+    if not music_tracks_raw:
+        raise HTTPException(status_code=400, detail="No musicTracks provided")
+
+    output_duration = _parse_form_float(form_data, "duration", None, minimum=0.1, allow_none=True)
+    temp_files_to_cleanup: List[str] = []
+
+    try:
+        parsed_music_tracks = await _save_uploaded_music_tracks(
+            form_data,
+            music_tracks_raw,
+            temp_files_to_cleanup,
+        )
+        if not parsed_music_tracks:
+            raise HTTPException(status_code=400, detail="No valid uploaded audio files found")
+
+        output_path = os.path.join(OUTPUT_DIR, f"merged_audio_{uuid.uuid4().hex}.m4a")
+        success = await merge_audio_tracks(
+            audio_tracks=parsed_music_tracks,
+            output_path=output_path,
+            output_duration=output_duration,
+        )
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Audio merge failed")
+
+        background_tasks.add_task(cleanup_file, output_path)
+        return FileResponse(path=output_path, media_type="audio/mp4", filename=Path(output_path).name)
 
     except HTTPException:
         raise

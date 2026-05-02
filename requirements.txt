@@ -2,4 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 rembg[cpu]
-
+torch
+realesrgan
+basicsr
+opencv-python-headless

@@ -1,6 +1,6 @@
-# FastAPI Server with Background Removal, EPS Conversion, and Video Processing
+# FastAPI Server with Background Removal, Image Enhancement, EPS Conversion, and Video Processing
 
-A FastAPI server with image background removal, EPS-to-SVG conversion, and video processing capabilities.
+A FastAPI server with image background removal, Real-ESRGAN image enhancement, EPS-to-SVG conversion, and video processing capabilities.
 
 ## 🚀 Quick Start
 
@@ -112,6 +112,11 @@ Open your browser and navigate to:
 |--------|----------|-------------|--------------|
 | POST | `/remove-bg` | Remove image background | `file`: Image file (PNG, JPG, etc.) |
 
+### Image Enhancement
+| Method | Endpoint | Description | Request Body |
+|--------|----------|-------------|--------------|
+| POST | `/image-enhance` | Enhance/upscale an image with Real-ESRGAN | `file`: Image file, optional `outscale`: 0-4 |
+
 ### EPS Conversion
 | Method | Endpoint | Description | Request Body |
 |--------|----------|-------------|--------------|
@@ -140,6 +145,32 @@ curl -X POST -F "file=@diagram.eps" http://localhost:8000/convert/eps-to-svg --o
 Response: SVG file download (`image/svg+xml`)
 
 ## Video Processing API Details
+
+## Image Enhancement API Details
+
+### Enhance Image
+```bash
+curl -X POST \
+  -F "file=@photo.jpg" \
+  -F "outscale=4" \
+  http://localhost:8000/image-enhance --output enhanced.png
+```
+
+Response: Enhanced PNG image download
+
+### Real-ESRGAN Model Setup
+
+This endpoint requires Real-ESRGAN weights to be available locally.
+
+1. Install the Python dependencies in `requirements.txt`
+2. Download `RealESRGAN_x4plus.pth`
+3. Place it at `weights/RealESRGAN_x4plus.pth`
+
+Or set a custom path:
+
+```bash
+export REAL_ESRGAN_MODEL_PATH=/absolute/path/to/RealESRGAN_x4plus.pth
+```
 
 ### Check FFmpeg Installation
 ```bash
@@ -327,6 +358,10 @@ curl -X POST \
 |----------|---------|-------------|
 | `DEBUG_KEEP_UPLOADS` | false | Set to "true" to keep uploaded files for debugging |
 | `DEBUG_VERBOSE` | false | Set to "true" for detailed logging |
+| `REAL_ESRGAN_MODEL_PATH` | `weights/RealESRGAN_x4plus.pth` | Path to Real-ESRGAN weights |
+| `REAL_ESRGAN_TILE` | `0` | Tile size for low-memory enhancement |
+| `REAL_ESRGAN_TILE_PAD` | `10` | Tile padding for Real-ESRGAN |
+| `REAL_ESRGAN_PRE_PAD` | `0` | Pre-padding for Real-ESRGAN |
 
 ## Project Structure
 ```
@@ -398,6 +433,10 @@ uvicorn main:app --reload --port 8001
 | uvicorn | >=0.23.0 | ASGI server |
 | python-multipart | >=0.0.6 | Form data parsing |
 | rembg | >=2.0.50 | Background removal |
+| torch | latest | Runtime for Real-ESRGAN |
+| realesrgan | latest | Image upscaling model wrapper |
+| basicsr | latest | Real-ESRGAN model architecture |
+| opencv-python-headless | latest | Image array conversions |
 | pydantic | >=2.7.0 | Data validation |
 | onnxruntime | >=1.23.2 | ML inference runtime |
 | numpy | >=2.3.0 | Numerical computing |

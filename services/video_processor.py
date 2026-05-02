@@ -812,6 +812,113 @@ async def extract_audio(
         raise VideoProcessingError(f"FFmpeg error: {str(e)}")
 
 
+async def merge_audio_tracks(
+    audio_tracks: List[Dict[str, Any]],
+    output_path: str,
+    output_duration: Optional[float] = None,
+) -> bool:
+    """
+    Mix one or more audio files into a single AAC/M4A audio file.
+
+    Each track dict supports:
+    - path: uploaded audio file path
+    - start: timeline start in seconds
+    - end: optional timeline end in seconds
+    - volume: 0.0-2.0 multiplier
+    """
+    normalized_tracks: List[Dict[str, Any]] = []
+    for track in audio_tracks or []:
+        if not isinstance(track, dict):
+            continue
+
+        track_path = track.get("path")
+        if not track_path or not os.path.exists(track_path):
+            continue
+
+        start = max(0.0, float(track.get("start", 0.0) or 0.0))
+        end = track.get("end")
+        end_time = float(end) if end is not None else None
+        if end_time is not None and end_time < start:
+            end_time = start
+
+        volume = max(0.0, min(float(track.get("volume", 1.0) or 1.0), 2.0))
+        normalized_tracks.append({
+            "path": track_path,
+            "start": start,
+            "end": end_time,
+            "volume": volume,
+        })
+
+    if not normalized_tracks:
+        raise VideoProcessingError("No valid audio tracks provided")
+
+    ffmpeg_cmd = ["ffmpeg"]
+    for track in normalized_tracks:
+        ffmpeg_cmd.extend(["-i", track["path"]])
+
+    filter_parts: List[str] = []
+    mix_inputs: List[str] = []
+
+    for index, track in enumerate(normalized_tracks):
+        label = f"a{index}"
+        track_duration = None
+        if track["end"] is not None:
+            track_duration = max(0.001, track["end"] - track["start"])
+
+        filters = []
+        if track_duration is not None:
+            filters.append(f"atrim=duration={track_duration}")
+        filters.extend([
+            "asetpts=PTS-STARTPTS",
+            f"volume={track['volume']}",
+        ])
+
+        delay_ms = int(round(track["start"] * 1000))
+        if delay_ms > 0:
+            filters.append(f"adelay={delay_ms}:all=1")
+
+        filters.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
+        filter_parts.append(f"[{index}:a]{','.join(filters)}[{label}]")
+        mix_inputs.append(f"[{label}]")
+
+    mixed_label = "mixed"
+    if len(mix_inputs) == 1:
+        filter_parts.append(f"{mix_inputs[0]}anull[{mixed_label}]")
+    else:
+        filter_parts.append(
+            f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:"
+            f"duration=longest:dropout_transition=2:normalize=0[{mixed_label}]"
+        )
+
+    output_label = mixed_label
+    if output_duration is not None and output_duration > 0:
+        output_label = "outa"
+        filter_parts.append(
+            f"[{mixed_label}]apad,atrim=duration={output_duration},"
+            f"asetpts=PTS-STARTPTS[{output_label}]"
+        )
+
+    ffmpeg_cmd.extend([
+        "-filter_complex", ";".join(filter_parts),
+        "-map", f"[{output_label}]",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-y",
+        output_path,
+    ])
+
+    returncode, _, stderr = await _run_ffmpeg_command(ffmpeg_cmd)
+    if returncode != 0:
+        raise VideoProcessingError(f"Audio merge failed: {stderr}")
+
+    if not os.path.exists(output_path):
+        raise VideoProcessingError("Audio merge completed but no output file")
+
+    print(f"[SUCCESS] Audio tracks merged: {output_path}")
+    return True
+
+
 async def generate_gif(
     input_path: str,
     output_path: str,
