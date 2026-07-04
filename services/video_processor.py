@@ -994,3 +994,81 @@ def cleanup_files(file_paths: List[str]) -> None:
     """Safely delete multiple files"""
     for path in file_paths:
         cleanup_file(path)
+
+
+async def create_video_from_images(
+    image_paths: List[str],
+    durations: List[float],
+    output_path: str
+) -> bool:
+    """
+    Create a video by concatenating multiple images, each with a specific duration.
+    All images are normalized to a standard resolution (1920x1080) with padding to avoid distortion.
+    """
+    if not image_paths:
+        raise VideoProcessingError("No image files provided")
+
+    temp_clips: List[str] = []
+    try:
+        for idx, (img_path, duration) in enumerate(zip(image_paths, durations)):
+            clip_path = f"{img_path}_{uuid.uuid4().hex}_temp.mp4"
+            temp_clips.append(clip_path)
+            
+            # Create a silent audio track + loop the image
+            # Normalizing to 1920x1080 aspect ratio.
+            # Scale to fit, pad to fill 1920x1080.
+            # -pix_fmt yuv420p is required for compatibility with many web players.
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-loop', '1',
+                '-t', str(duration),
+                '-i', img_path,
+                '-f', 'lavfi',
+                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                '-t', str(duration),
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-r', '30',
+                '-c:a', 'aac',
+                '-ac', '2',
+                '-ar', '44100',
+                '-y',
+                clip_path
+            ]
+            returncode, stdout, stderr = await _run_ffmpeg_command(ffmpeg_cmd)
+            if returncode != 0:
+                raise VideoProcessingError(f"Failed to process image {idx} to video: {stderr}")
+
+        # Now concatenate all the temporary clips using the concat demuxer!
+        concat_list_path = f"{output_path}_concat.txt"
+        with open(concat_list_path, 'w', encoding='utf-8') as concat_file:
+            for clip in temp_clips:
+                concat_file.write(f"file '{os.path.abspath(clip)}'\n")
+
+        # Concat the clips
+        ffmpeg_cmd = [
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concat_list_path,
+            '-c', 'copy',
+            '-y',
+            output_path
+        ]
+        
+        returncode, stdout, stderr = await _run_ffmpeg_command(ffmpeg_cmd)
+        
+        cleanup_file(concat_list_path)
+
+        if returncode != 0:
+            raise VideoProcessingError(f"Failed to concatenate image clips: {stderr}")
+            
+        if not os.path.exists(output_path):
+            raise VideoProcessingError("Video creation completed but output file does not exist")
+            
+        return True
+    finally:
+        for clip in temp_clips:
+            cleanup_file(clip)
+

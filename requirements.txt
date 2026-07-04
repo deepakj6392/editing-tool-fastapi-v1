@@ -6,3 +6,6 @@ torch
 realesrgan
 basicsr
 opencv-python-headless
+transformers
+scipy
+gtts

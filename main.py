@@ -38,8 +38,10 @@ from services.video_processor import (
     is_ffmpeg_installed,
     is_ffprobe_installed,
     VideoProcessingError,
+    create_video_from_images,
 )
 from services.video_deleter import delete_frame_from_video
+from services.speech_generator import generate_ai_speech
 
 from services.background_remover import (
     remove_background,
@@ -980,6 +982,127 @@ async def delete_frame_endpoint(request: Request, background_tasks: BackgroundTa
         if not should_keep_file():
             for f in temp_files:
                 cleanup_file(f)
+
+
+@app.post("/video/create-from-images")
+async def create_video_from_images_endpoint(
+    images: List[UploadFile] = File(...),
+    durations: str = Form("[]"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Create a video from selected multiple images with custom durations.
+    """
+    if not is_ffmpeg_installed():
+        raise HTTPException(status_code=500, detail="FFmpeg is not installed")
+
+    log_debug("=" * 60)
+    log_debug("CREATE VIDEO FROM IMAGES ENDPOINT")
+    log_debug("=" * 60)
+
+    try:
+        durations_list = json.loads(durations)
+        if not isinstance(durations_list, list):
+            durations_list = []
+    except Exception:
+        durations_list = []
+
+    try:
+        durations_list = [float(d) for d in durations_list]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid durations list format: {str(exc)}")
+
+    if not images:
+        raise HTTPException(status_code=400, detail="No image files provided")
+
+    final_durations = []
+    for idx in range(len(images)):
+        duration = 1.0
+        if idx < len(durations_list):
+            val = durations_list[idx]
+            if val > 0:
+                duration = val
+        final_durations.append(duration)
+
+    saved_image_paths = []
+    try:
+        for idx, img_file in enumerate(images):
+            safe_name = _safe_filename(img_file.filename, f"image_{idx}.png")
+            image_path = os.path.join(UPLOAD_DIR, f"slideshow_img_{idx}_{uuid.uuid4().hex}_{safe_name}")
+            with open(image_path, "wb") as f:
+                content = await img_file.read()
+                f.write(content)
+            saved_image_paths.append(image_path)
+
+        output_path = os.path.join(OUTPUT_DIR, f"slideshow_{uuid.uuid4().hex}.mp4")
+
+        success = await create_video_from_images(
+            image_paths=saved_image_paths,
+            durations=final_durations,
+            output_path=output_path
+        )
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to generate video from images")
+
+        log_debug(f"SUCCESS: Slideshow video created -> {output_path}")
+
+        background_tasks.add_task(cleanup_file, output_path)
+
+        return FileResponse(path=output_path, media_type="video/mp4", filename=Path(output_path).name)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_debug(f"ERROR creating slideshow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if not should_keep_file():
+            for f in saved_image_paths:
+                cleanup_file(f)
+
+
+@app.post("/audio/generate-speech")
+async def generate_speech_endpoint(
+    text: str = Form(...),
+    lang: str = Form("en"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Generate customized speech voiceover from text using Google Text-to-Speech (gTTS).
+    """
+    log_debug("=" * 60)
+    log_debug(f"GENERATE SPEECH ENDPOINT | Text: '{text[:50]}...' | Lang: {lang}")
+    log_debug("=" * 60)
+
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text string cannot be empty")
+
+    output_filename = f"ai_speech_{uuid.uuid4().hex}.mp3"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+    try:
+        await generate_ai_speech(
+            text=text.strip(),
+            output_path=output_path,
+            lang=lang
+        )
+
+        if not os.path.exists(output_path):
+            raise HTTPException(status_code=500, detail="Generated speech file was not found")
+
+        # Clean up output file after response is sent
+        background_tasks.add_task(cleanup_file, output_path)
+
+        return FileResponse(
+            path=output_path,
+            media_type="audio/mpeg",
+            filename=output_filename
+        )
+
+    except Exception as e:
+        log_debug(f"ERROR in AI speech generation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
