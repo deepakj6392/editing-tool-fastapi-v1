@@ -999,7 +999,8 @@ def cleanup_files(file_paths: List[str]) -> None:
 async def create_video_from_images(
     image_paths: List[str],
     durations: List[float],
-    output_path: str
+    output_path: str,
+    effects: List[str] = None
 ) -> bool:
     """
     Create a video by concatenating multiple images, each with a specific duration.
@@ -1008,11 +1009,45 @@ async def create_video_from_images(
     if not image_paths:
         raise VideoProcessingError("No image files provided")
 
+    if effects is None:
+        effects = []
+
+    final_effects = []
+    for idx in range(len(image_paths)):
+        effect = "fade"
+        if idx < len(effects):
+            effect = effects[idx]
+        final_effects.append(effect)
+
     temp_clips: List[str] = []
     try:
         for idx, (img_path, duration) in enumerate(zip(image_paths, durations)):
             clip_path = f"{img_path}_{uuid.uuid4().hex}_temp.mp4"
             temp_clips.append(clip_path)
+            
+            # Base video filter: scale and pad to 1920x1080
+            vf_filter = 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2'
+            
+            # Apply selected transition/animation effect
+            eff = final_effects[idx]
+            if eff == "fade":
+                fade_duration = min(0.5, duration / 2.0)
+                fade_out_start = max(0.0, duration - fade_duration)
+                vf_filter += f",fade=t=in:st=0:d={fade_duration},fade=t=out:st={fade_out_start}:d={fade_duration}"
+            elif eff == "zoom_in":
+                vf_filter += ",zoompan=z='min(zoom+0.0015,1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080"
+            elif eff == "zoom_out":
+                vf_filter += ",zoompan=z='max(1.15-0.0015*on,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080"
+            elif eff == "spin":
+                vf_filter += f",rotate=a='2*PI*t/{duration}':c=black"
+            elif eff == "rotate_swing":
+                vf_filter += f",rotate=a='0.08*sin(2*PI*t/min({duration},4.0))':c=black"
+            elif eff == "pan_right":
+                total_frames = max(1, int(duration * 30))
+                vf_filter += f",zoompan=z=1.25:x='(iw-iw/zoom)*(on/{total_frames})':y='(ih-ih/zoom)/2':d=1:s=1920x1080"
+            elif eff == "pan_left":
+                total_frames = max(1, int(duration * 30))
+                vf_filter += f",zoompan=z=1.25:x='(iw-iw/zoom)*(1-on/{total_frames})':y='(ih-ih/zoom)/2':d=1:s=1920x1080"
             
             # Create a silent audio track + loop the image
             # Normalizing to 1920x1080 aspect ratio.
@@ -1021,6 +1056,7 @@ async def create_video_from_images(
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-loop', '1',
+                '-framerate', '30',
                 '-t', str(duration),
                 '-i', img_path,
                 '-f', 'lavfi',
@@ -1028,7 +1064,7 @@ async def create_video_from_images(
                 '-t', str(duration),
                 '-c:v', 'libx264',
                 '-pix_fmt', 'yuv420p',
-                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+                '-vf', vf_filter,
                 '-r', '30',
                 '-c:a', 'aac',
                 '-ac', '2',

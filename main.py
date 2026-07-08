@@ -988,6 +988,7 @@ async def delete_frame_endpoint(request: Request, background_tasks: BackgroundTa
 async def create_video_from_images_endpoint(
     images: List[UploadFile] = File(...),
     durations: str = Form("[]"),
+    effects: str = Form("[]"),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
@@ -1012,10 +1013,18 @@ async def create_video_from_images_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid durations list format: {str(exc)}")
 
+    try:
+        effects_list = json.loads(effects)
+        if not isinstance(effects_list, list):
+            effects_list = []
+    except Exception:
+        effects_list = []
+
     if not images:
         raise HTTPException(status_code=400, detail="No image files provided")
 
     final_durations = []
+    final_effects = []
     for idx in range(len(images)):
         duration = 1.0
         if idx < len(durations_list):
@@ -1023,6 +1032,13 @@ async def create_video_from_images_endpoint(
             if val > 0:
                 duration = val
         final_durations.append(duration)
+
+        effect = "fade"
+        if idx < len(effects_list):
+            val = effects_list[idx]
+            if val in ["fade", "zoom_in", "zoom_out", "spin", "rotate_swing", "pan_right", "pan_left", "none"]:
+                effect = val
+        final_effects.append(effect)
 
     saved_image_paths = []
     try:
@@ -1039,7 +1055,8 @@ async def create_video_from_images_endpoint(
         success = await create_video_from_images(
             image_paths=saved_image_paths,
             durations=final_durations,
-            output_path=output_path
+            output_path=output_path,
+            effects=final_effects
         )
 
         if not success:
